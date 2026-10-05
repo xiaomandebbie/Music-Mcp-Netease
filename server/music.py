@@ -83,6 +83,7 @@ def _load_or_create_secret() -> str:
 # ── Request handler ──────────────────────────────────────────────────────────
 
 class MusicHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     state: "ServerState"
 
     server_version = "Music/1.1"
@@ -102,7 +103,35 @@ class MusicHandler(BaseHTTPRequestHandler):
     # ── Helpers ──
 
     def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", 0))
+        """读请求体，同时认 Content-Length 和 chunked。
+
+        Python 的 BaseHTTPRequestHandler 不支持 Transfer-Encoding: chunked,
+        只会去读 Content-Length。而浏览器用 HTTP/2 连到反代、再被转成 HTTP/1.1
+        发给我们时，常常是不带 Content-Length 只带 chunked 的。后果:
+        这里读到空 body -> 所有 POST 处理函数都判成「缺字段」-> 400,
+        而 socket 里剩下的分块框架又被当成下一条请求行解析 ->
+        日志里那句 Bad request syntax ('2c')。
+        浏览器端所有写操作(收藏/取消/建单/删歌/批注)因此全部静默失效。
+        """
+        enc = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in enc:
+            parts = []
+            while True:
+                line = self.rfile.readline(65536).strip()
+                if b";" in line:          # 分块扩展，用不到，切掉
+                    line = line.split(b";", 1)[0]
+                try:
+                    size = int(line, 16)
+                except ValueError:
+                    break                 # 框架坏了，别把整条连接拖下水
+                if size == 0:
+                    self.rfile.readline(65536)   # 收尾空行
+                    break
+                parts.append(self.rfile.read(size))
+                self.rfile.readline(65536)       # 每块后面的 CRLF
+            raw = b"".join(parts)
+            return json.loads(raw) if raw else {}
+        length = int(self.headers.get("Content-Length", 0) or 0)
         if not length:
             return {}
         raw = self.rfile.read(length)
@@ -257,6 +286,30 @@ class MusicHandler(BaseHTTPRequestHandler):
         p = self._playlist_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(songs, ensure_ascii=False))
+
+    def _unliked_path(self) -> Path:
+        """本地说「这颗心已经取消了」的 songId 名单。
+
+        网易云那个 like 口子偶尔回 200 却没真删掉，开机时
+        /music/netease/likes 会把全量红心拉回来，刚取消的那颗心又亮了。
+        这份名单就是挡这一下的：回灌时先过一遍，取消过的不算数。
+        重新收藏一首时，从名单里拿出来。
+        """
+        return self.state.data_dir / "music_unliked.json"
+
+    def _load_unliked(self) -> set:
+        p = self._unliked_path()
+        if p.exists():
+            try:
+                return {str(x) for x in json.loads(p.read_text())}
+            except Exception:
+                pass
+        return set()
+
+    def _save_unliked(self, ids: set):
+        p = self._unliked_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(sorted(ids), ensure_ascii=False))
 
     def _music_data_path(self) -> Path:
         return self.state.data_dir / "music_data.json"
@@ -713,6 +766,11 @@ class MusicHandler(BaseHTTPRequestHandler):
             return
         playlist.append(song)
         self._save_playlist(playlist)
+        # 重新收藏：把这颗心从「已取消」名单里拿出来，不然它还会被挡
+        unliked = self._load_unliked()
+        if str(song["songId"]) in unliked:
+            unliked.discard(str(song["songId"]))
+            self._save_unliked(unliked)
         # Also add to "liked" in multi-playlist system
         data = self._load_music_data()
         for pl in data["playlists"]:
@@ -724,13 +782,35 @@ class MusicHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "songs": playlist})
 
     def _handle_music_playlist_remove(self, body: dict):
+        """取消红心。
+
+        旧版只删 legacy 歌单，liked 多歌单原封不动 —— 从 Liked 页进去歌还在，
+        看着就是「取消了没反应」。现在两处一起删，再记进 unliked 名单，
+        挡住开机时从网易云回灌。
+        """
         song_id = body.get("songId")
         if not song_id:
             self._send_json(400, {"error": "missing songId"})
             return
+        sid = str(song_id)
         playlist = self._load_playlist()
-        playlist = [s for s in playlist if s.get("songId") != song_id]
+        playlist = [s for s in playlist if str(s.get("songId")) != sid]
         self._save_playlist(playlist)
+
+        data = self._load_music_data()
+        for pl in data.get("playlists", []):
+            if pl.get("id") != "liked":
+                continue
+            before = len(pl.get("songs") or [])
+            pl["songs"] = [s for s in (pl.get("songs") or []) if str(s.get("songId")) != sid]
+            if len(pl["songs"]) != before:
+                self._save_music_data(data)
+            break
+
+        unliked = self._load_unliked()
+        unliked.add(sid)
+        self._save_unliked(unliked)
+
         self._send_json(200, {"ok": True, "songs": playlist})
 
     # ── Multi-playlist system ──
@@ -1252,6 +1332,9 @@ class MusicHandler(BaseHTTPRequestHandler):
             self._send_json(502, {"error": "红心列表拉取失败"})
             return
         ids = d.get("ids") or []
+        unliked = self._load_unliked()
+        if unliked:
+            ids = [i for i in ids if str(i) not in unliked]
         self._send_json(200, {"ok": True, "count": len(ids), "ids": ids})
 
     def _handle_netease_like(self, body: dict):
@@ -1417,7 +1500,7 @@ class MusicHandler(BaseHTTPRequestHandler):
                     entry[key] = body[key]
             entry["name"] = body.get("name", entry.get("name", ""))
             entry["artist"] = body.get("artist", entry.get("artist", ""))
-            entry["notedBy"] = body.get("by", "anko")
+            entry["notedBy"] = body.get("by", "小満")
             entry["notedAt"] = now
         elif action == "like":
             entry["liked"] = True
